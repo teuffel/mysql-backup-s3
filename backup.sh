@@ -1,36 +1,31 @@
-#!/bin/sh
+#!/bin/bash
 
-set -e
+set -eo pipefail
 
-if [ "${S3_ACCESS_KEY_ID}" = "**None**" ]; then
+if [ "${S3_ACCESS_KEY_ID}" == "**None**" ]; then
   echo "Warning: You did not set the S3_ACCESS_KEY_ID environment variable."
 fi
 
-if [ "${S3_SECRET_ACCESS_KEY}" = "**None**" ]; then
+if [ "${S3_SECRET_ACCESS_KEY}" == "**None**" ]; then
   echo "Warning: You did not set the S3_SECRET_ACCESS_KEY environment variable."
 fi
 
-if [ "${S3_BUCKET}" = "**None**" ]; then
+if [ "${S3_BUCKET}" == "**None**" ]; then
   echo "You need to set the S3_BUCKET environment variable."
   exit 1
 fi
 
-if [ "${MYSQLDUMP_DATABASE}" = "**None**" ]; then
-  echo "You need to set the MYSQLDUMP_DATABASE environment variable (database name OR --all-databases)."
-  exit 1
-fi
-
-if [ "${MYSQL_HOST}" = "**None**" ]; then
+if [ "${MYSQL_HOST}" == "**None**" ]; then
   echo "You need to set the MYSQL_HOST environment variable."
   exit 1
 fi
 
-if [ "${MYSQL_USER}" = "**None**" ]; then
+if [ "${MYSQL_USER}" == "**None**" ]; then
   echo "You need to set the MYSQL_USER environment variable."
   exit 1
 fi
 
-if [ "${MYSQL_PASSWORD}" = "**None**" ]; then
+if [ "${MYSQL_PASSWORD}" == "**None**" ]; then
   echo "You need to set the MYSQL_PASSWORD environment variable or link to a container named MYSQL."
   exit 1
 fi
@@ -45,20 +40,27 @@ fi
 MYSQL_HOST_OPTS="-h $MYSQL_HOST -P $MYSQL_PORT -u$MYSQL_USER -p$MYSQL_PASSWORD"
 DUMP_START_TIME=$(date +"%Y-%m-%dT%H%M%SZ")
 
-mysqldump --version
-
 copy_s3 () {
   SRC_FILE=$1
   DEST_FILE=$2
 
-  if [ "${S3_ENDPOINT}" = "**None**" ]; then
+  if [ "${S3_ENDPOINT}" == "**None**" ]; then
     AWS_ARGS=""
   else
     AWS_ARGS="--endpoint-url ${S3_ENDPOINT}"
   fi
 
-  echo "Uploading ${DEST_FILE} on S3..."
+  if [ "${S3_ENSURE_BUCKET_EXISTS}" != "no" ]; then
+    echo "Ensuring S3 bucket $S3_BUCKET exists"
+    EXISTS_ERR=`aws $AWS_ARGS s3api head-bucket --bucket "$S3_BUCKET" 2>&1 || true`
+    if [[ ! -z "$EXISTS_ERR" ]]; then
+      echo "Bucket $S3_BUCKET not found (or owned by someone else), attempting to create"
+      aws $AWS_ARGS s3api create-bucket --bucket $S3_BUCKET
+    fi
+  fi
 
+  echo "Uploading ${DEST_FILE} on S3..."
+  
   cat $SRC_FILE | aws $AWS_ARGS s3 cp - s3://$S3_BUCKET/$S3_PREFIX/$DEST_FILE
 
   if [ $? != 0 ]; then
@@ -68,9 +70,14 @@ copy_s3 () {
   rm $SRC_FILE
 }
 
-# Multi databases: yes
-if [ ! -z "$(echo $MULTI_DATABASES | grep -i -E "(yes|true|1)")" ]; then
-  if [ "${MYSQLDUMP_DATABASE}" = "--all-databases" ]; then
+# mysqldump extra options
+if [ ! -z "${MYSQLDUMP_EXTRA_OPTIONS}" ]; then
+  MYSQLDUMP_OPTIONS="${MYSQLDUMP_OPTIONS} ${MYSQLDUMP_EXTRA_OPTIONS}"
+fi
+
+# Multi file: yes
+if [ ! -z "$(echo $MULTI_FILES | grep -i -E "(yes|true|1)")" ]; then
+  if [ "${MYSQLDUMP_DATABASE}" == "--all-databases" ]; then
     DATABASES=`mysql $MYSQL_HOST_OPTS -e "SHOW DATABASES;" | grep -Ev "(Database|information_schema|performance_schema|mysql|sys|innodb)"`
   else
     DATABASES=$MYSQLDUMP_DATABASE
@@ -81,10 +88,10 @@ if [ ! -z "$(echo $MULTI_DATABASES | grep -i -E "(yes|true|1)")" ]; then
 
     DUMP_FILE="/tmp/${DB}.sql.gz"
 
-    mysqldump $MYSQL_HOST_OPTS $MYSQLDUMP_OPTIONS $DB | gzip > $DUMP_FILE
+    mysqldump $MYSQL_HOST_OPTS $MYSQLDUMP_OPTIONS --databases $DB | gzip > $DUMP_FILE
 
-    if [ $? = 0 ]; then
-      if [ "${S3_FILENAME}" = "**None**" ]; then
+    if [ $? == 0 ]; then
+      if [ "${S3_FILENAME}" == "**None**" ]; then
         S3_FILE="${DUMP_START_TIME}.${DB}.sql.gz"
       else
         S3_FILE="${S3_FILENAME}.${DB}.sql.gz"
@@ -95,24 +102,23 @@ if [ ! -z "$(echo $MULTI_DATABASES | grep -i -E "(yes|true|1)")" ]; then
       >&2 echo "Error creating dump of ${DB}"
     fi
   done
-# Multi databases: no
+# Multi file: no
 else
   echo "Creating dump for ${MYSQLDUMP_DATABASE} from ${MYSQL_HOST}..."
-  DB=$MYSQLDUMP_DATABASE
 
-  DUMP_FILE="/tmp/${DB}.sql.gz"
-  mysqldump $MYSQL_HOST_OPTS $MYSQLDUMP_OPTIONS $DB | gzip > $DUMP_FILE
+  DUMP_FILE="/tmp/dump.sql.gz"
+  mysqldump $MYSQL_HOST_OPTS $MYSQLDUMP_OPTIONS $MYSQLDUMP_DATABASE | gzip > $DUMP_FILE
 
-  if [ $? = 0 ]; then
-    if [ "${S3_FILENAME}" = "**None**" ]; then
-      S3_FILE="${DUMP_START_TIME}.${DB}.sql.gz"
+  if [ $? == 0 ]; then
+    if [ "${S3_FILENAME}" == "**None**" ]; then
+      S3_FILE="${DUMP_START_TIME}.dump.sql.gz"
     else
-      S3_FILE="${S3_FILENAME}.${DB}.sql.gz"
+      S3_FILE="${S3_FILENAME}.sql.gz"
     fi
 
     copy_s3 $DUMP_FILE $S3_FILE
   else
-    >&2 echo "Error creating dump of ${DB}"
+    >&2 echo "Error creating dump of all databases"
   fi
 fi
 
